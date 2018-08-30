@@ -6,13 +6,13 @@ import os.path as osp
 import tensorflow as tf
 from baselines import logger
 from collections import deque
+from baselines.som.som_gpu import SOM
 from baselines.common import explained_variance
 from baselines.common.runners import AbstractEnvRunner
 
 class Model(object):
     def __init__(self, *, policy, ob_space, ac_space, nbatch_act, nbatch_train,
-                nsteps, ent_coef, vf_coef, max_grad_norm):
-        sess = tf.get_default_session()
+                nsteps, ent_coef, vf_coef, max_grad_norm, sess):
 
         act_model = policy(sess, ob_space, ac_space, nbatch_act, 1, reuse=False)
         train_model = policy(sess, ob_space, ac_space, nbatch_train, nsteps, reuse=True)
@@ -87,29 +87,43 @@ class Model(object):
 
 class Runner(AbstractEnvRunner):
 
-    def __init__(self, *, env, model, nsteps, gamma, lam):
+    def __init__(self, *, env, model, nsteps, gamma, lam, som):
         super().__init__(env=env, model=model, nsteps=nsteps)
         self.lam = lam
         self.gamma = gamma
+        self.som = som
 
     def run(self):
-        mb_obs, mb_rewards, mb_actions, mb_values, mb_dones, mb_neglogpacs = [],[],[],[],[],[]
+        mb_obs, som_obs, mb_mapped_obs, mb_rewards, mb_actions, mb_values, mb_dones, mb_neglogpacs = [],[],[],[],[],[],[],[]
         mb_states = self.states
         epinfos = []
         for _ in range(self.nsteps):
             actions, values, self.states, neglogpacs = self.model.step(self.obs, self.states, self.dones)
-            mb_obs.append(self.obs.copy())
             mb_actions.append(actions)
             mb_values.append(values)
             mb_neglogpacs.append(neglogpacs)
-            mb_dones.append(self.dones)
+
             self.obs[:], rewards, self.dones, infos = self.env.step(actions)
+
+            mb_obs.append(self.obs.copy())
+            som_obs.append(self.obs[0].copy())
+            mb_dones.append(self.dones)
+
+            if (self.som.trained()):
+                mapped_obs = self.som.map_vect(self.obs[0])
+            else:
+                mapped_obs = self.obs[0]
+            mb_mapped_obs.append(mapped_obs)
+
+            rewards = [self.homeostatic_reward(mb_mapped_obs)]
+
             for info in infos:
                 maybeepinfo = info.get('episode')
                 if maybeepinfo: epinfos.append(maybeepinfo)
             mb_rewards.append(rewards)
         #batch of steps to batch of rollouts
         mb_obs = np.asarray(mb_obs, dtype=self.obs.dtype)
+        som_obs = np.asarray(som_obs, dtype=self.obs.dtype)
         mb_rewards = np.asarray(mb_rewards, dtype=np.float32)
         mb_actions = np.asarray(mb_actions)
         mb_values = np.asarray(mb_values, dtype=np.float32)
@@ -119,6 +133,9 @@ class Runner(AbstractEnvRunner):
         #discount/bootstrap off value fn
         mb_returns = np.zeros_like(mb_rewards)
         mb_advs = np.zeros_like(mb_rewards)
+        with self.som._graph.as_default():
+            som_writer = tf.summary.FileWriter(logger.get_dir() + '/som', self.som._graph)
+            self.som.train(som_obs, som_writer)
         lastgaelam = 0
         for t in reversed(range(self.nsteps)):
             if t == self.nsteps - 1:
@@ -132,6 +149,13 @@ class Runner(AbstractEnvRunner):
         mb_returns = mb_advs + mb_values
         return (*map(sf01, (mb_obs, mb_returns, mb_dones, mb_actions, mb_values, mb_neglogpacs)),
             mb_states, epinfos)
+
+    def homeostatic_reward(self, obs):
+        if len(obs) > 1:
+            reward = -np.mean(np.square(obs[-2] - obs[-1]))
+        else:
+            reward = -1
+
 # obs, returns, masks, actions, values, neglogpacs, states = runner.run()
 def sf01(arr):
     """
@@ -139,6 +163,17 @@ def sf01(arr):
     """
     s = arr.shape
     return arr.swapaxes(0, 1).reshape(s[0] * s[1], *s[2:])
+
+
+    # reward = 0
+    # if len(obs) > 30:
+    #     for i in range(0, 15):
+    #         reward += -np.mean(np.square(obs[i] - obs[i+15]))
+    # else:
+    #     reward = -1
+    #
+    #
+    return [reward]
 
 def constfn(val):
     def f(_):
@@ -148,7 +183,7 @@ def constfn(val):
 def learn(*, policy, env, nsteps, total_timesteps, ent_coef, lr,
             vf_coef=0.5,  max_grad_norm=0.5, gamma=0.99, lam=0.95,
             log_interval=10, nminibatches=4, noptepochs=4, cliprange=0.2,
-            save_interval=0, load_path=None):
+            save_interval=0, load_path=None, session=None):
 
     if isinstance(lr, float): lr = constfn(lr)
     else: assert callable(lr)
@@ -163,16 +198,24 @@ def learn(*, policy, env, nsteps, total_timesteps, ent_coef, lr,
     nbatch_train = nbatch // nminibatches
 
     make_model = lambda : Model(policy=policy, ob_space=ob_space, ac_space=ac_space, nbatch_act=nenvs, nbatch_train=nbatch_train,
-                    nsteps=nsteps, ent_coef=ent_coef, vf_coef=vf_coef,
-                    max_grad_norm=max_grad_norm)
+                    nsteps=nsteps, ent_coef=ent_coef, vf_coef=vf_coef, max_grad_norm=max_grad_norm, sess=session)
     if save_interval and logger.get_dir():
         import cloudpickle
         with open(osp.join(logger.get_dir(), 'make_model.pkl'), 'wb') as fh:
             fh.write(cloudpickle.dumps(make_model))
     model = make_model()
+    dim = ob_space.shape[0]
+    som_graph = tf.Graph()
+    som_session = tf.Session(graph=som_graph)
+    with som_graph.as_default():
+        som = SOM(m=3, n=3, dim=dim, graph=som_graph, session=som_session)
+        init_op = tf.global_variables_initializer()
+        som_session.run([init_op])
+
+
     if load_path is not None:
         model.load(load_path)
-    runner = Runner(env=env, model=model, nsteps=nsteps, gamma=gamma, lam=lam)
+    runner = Runner(env=env, model=model, nsteps=nsteps, gamma=gamma, lam=lam, som=som)
 
     epinfobuf = deque(maxlen=100)
     tfirststart = time.time()
@@ -228,7 +271,9 @@ def learn(*, policy, env, nsteps, total_timesteps, ent_coef, lr,
             logger.logkv('time_elapsed', tnow - tfirststart)
             for (lossval, lossname) in zip(lossvals, model.loss_names):
                 logger.logkv(lossname, lossval)
-            logger.dumpkvs()
+
+            logger.log_image('som', som.get_umatrix())
+
         if save_interval and (update % save_interval == 0 or update == 1) and logger.get_dir():
             checkdir = osp.join(logger.get_dir(), 'checkpoints')
             os.makedirs(checkdir, exist_ok=True)

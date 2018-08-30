@@ -6,6 +6,7 @@ import json
 import time
 import datetime
 import tempfile
+from PIL import Image
 from collections import defaultdict
 
 DEBUG = 10
@@ -23,7 +24,11 @@ class SeqWriter(object):
     def writeseq(self, seq):
         raise NotImplementedError
 
-class HumanOutputFormat(KVWriter, SeqWriter):
+class ImageWriter(object):
+    def writeimage(self, name, image):
+        raise NotImplementedError
+
+class HumanOutputFormat(KVWriter, SeqWriter, ImageWriter):
     def __init__(self, filename_or_file):
         if isinstance(filename_or_file, str):
             self.file = open(filename_or_file, 'wt')
@@ -78,6 +83,10 @@ class HumanOutputFormat(KVWriter, SeqWriter):
                 self.file.write(' ')
         self.file.write('\n')
         self.file.flush()
+
+    def writeimage(self, tag, image):
+        image = Image.fromarray(image)
+        image.show()
 
     def close(self):
         if self.own_file:
@@ -283,6 +292,8 @@ def profile(n):
         return func_wrapper
     return decorator_with_name
 
+def log_image(key, image):
+    Logger.CURRENT.log_image(key, image)
 
 # ================================================================
 # Backend
@@ -320,10 +331,16 @@ class Logger(object):
                 fmt.writekvs(self.name2val)
         self.name2val.clear()
         self.name2cnt.clear()
+        self.name2image.clear()
 
     def log(self, *args, level=INFO):
         if self.level <= level:
             self._do_log(args)
+
+    def log_image(self, key, image):
+        for fmt in self.output_formats:
+            if isinstance(fmt, ImageWriter):
+                fmt.writeimage(key, image)
 
     # Configuration
     # ----------------------------------------
