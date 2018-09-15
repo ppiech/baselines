@@ -134,8 +134,9 @@ class Runner(AbstractEnvRunner):
         mb_returns = np.zeros_like(mb_rewards)
         mb_advs = np.zeros_like(mb_rewards)
         with self.som._graph.as_default():
-            som_writer = tf.summary.FileWriter(logger.get_dir() + '/som', self.som._graph)
-            self.som.train(som_obs, som_writer)
+            # som_writer = tf.summary.FileWriter(logger.get_dir() + '/som', self.som._graph)
+            # self.som.train(som_obs, som_writer)
+            self.som.train(som_obs)
         lastgaelam = 0
         for t in reversed(range(self.nsteps)):
             if t == self.nsteps - 1:
@@ -272,7 +273,7 @@ def learn(*, policy, env, nsteps, total_timesteps, ent_coef, lr,
             for (lossval, lossname) in zip(lossvals, model.loss_names):
                 logger.logkv(lossname, lossval)
 
-            logger.log_image('som', som.get_umatrix())
+            # logger.log_image('som', som.get_umatrix())
 
         if save_interval and (update % save_interval == 0 or update == 1) and logger.get_dir():
             checkdir = osp.join(logger.get_dir(), 'checkpoints')

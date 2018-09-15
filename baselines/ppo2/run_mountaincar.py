@@ -39,8 +39,9 @@ def train(env_id, num_timesteps, seed):
 
 
 def main():
-    logger.configure(format_strs=['tensorboard', 'stdout'])
-    model, env = train("MountainCar-v0", num_timesteps=2000, seed=0)
+    # logger.configure(format_strs=['tensorboard', 'stdout'])
+    logger.configure(format_strs=['stdout'])
+    model, env = train("MountainCar-v0", num_timesteps=100000, seed=0)
 
     logger.log("Running trained model")
     obs = np.zeros((env.num_envs,) + env.observation_space.shape)
